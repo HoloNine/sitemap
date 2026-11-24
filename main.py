@@ -21,19 +21,85 @@ COMMON_SITEMAP_PATHS = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap.xml.gz")
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
 
-def build_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
-    retry = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "HEAD"),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+class FetchError(Exception):
+    """A URL could not be fetched; the message says why."""
+
+
+class HttpFetcher:
+    """Fetches URLs with plain HTTP requests."""
+
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET", "HEAD"),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def fetch(self, url: str) -> bytes:
+        try:
+            resp = self.session.get(url, timeout=TIMEOUT)
+        except requests.ConnectionError as exc:
+            raise FetchError(f"connection failed ({type(exc).__name__})") from exc
+        except requests.RequestException as exc:
+            raise FetchError(str(exc)) from exc
+        if not resp.ok:
+            raise FetchError(f"HTTP {resp.status_code}")
+        return resp.content
+
+    def __enter__(self) -> "HttpFetcher":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.session.close()
+
+
+class BrowserFetcher:
+    """Fetches URLs through a headless Chromium browser (Playwright).
+
+    Useful for sites that reject non-browser clients.
+    """
+
+    def __enter__(self) -> "BrowserFetcher":
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            sys.exit(
+                "error: --browser needs Playwright: "
+                "pip install playwright && python -m playwright install chromium"
+            )
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch()
+        self._context = self._browser.new_context()
+        self._page = self._context.new_page()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._browser.close()
+        self._pw.stop()
+
+    def fetch(self, url: str) -> bytes:
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            resp = self._page.goto(url, timeout=TIMEOUT * 3 * 1000)
+        except PlaywrightError:
+            # Navigation fails for downloads (e.g. .gz files); fall back to the
+            # context's request API, which shares the browser's cookies.
+            try:
+                resp = self._context.request.get(url, timeout=TIMEOUT * 3 * 1000)
+            except PlaywrightError as exc:
+                raise FetchError(str(exc).splitlines()[0]) from exc
+        if resp is None:
+            raise FetchError("no response")
+        if not resp.ok:
+            raise FetchError(f"HTTP {resp.status}")
+        return resp.body()
 
 
 def normalize_site_url(url: str) -> str:
@@ -43,54 +109,52 @@ def normalize_site_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def find_sitemap_urls(session: requests.Session, site_url: str) -> list[str]:
+def find_sitemap_urls(fetcher, site_url: str) -> list[str]:
     robots_url = urljoin(site_url + "/", "robots.txt")
     try:
-        resp = session.get(robots_url, timeout=TIMEOUT)
-        if resp.ok:
-            sitemaps = [
-                line.split(":", 1)[1].strip()
-                for line in resp.text.splitlines()
-                if line.lower().startswith("sitemap:")
-            ]
-            if sitemaps:
-                return sitemaps
-    except requests.RequestException:
-        pass
+        text = fetcher.fetch(robots_url).decode("utf-8", errors="replace")
+        sitemaps = [
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.lower().startswith("sitemap:")
+        ]
+        if sitemaps:
+            return sitemaps
+    except FetchError as exc:
+        print(f"warning: {robots_url}: {exc}", file=sys.stderr)
 
     for path in COMMON_SITEMAP_PATHS:
         candidate = urljoin(site_url, path)
         try:
-            resp = session.head(candidate, timeout=TIMEOUT, allow_redirects=True)
-            if resp.ok:
-                return [candidate]
-        except requests.RequestException:
+            content = decompress_if_gzip(candidate, fetcher.fetch(candidate))
+        except FetchError as exc:
+            print(f"warning: {candidate}: {exc}", file=sys.stderr)
             continue
+        except OSError:
+            continue
+        if b"<urlset" in content or b"<sitemapindex" in content:
+            return [candidate]
 
     return []
 
 
-def fetch_sitemap_bytes(session: requests.Session, url: str) -> bytes:
-    resp = session.get(url, timeout=TIMEOUT)
-    resp.raise_for_status()
-    content = resp.content
-    is_gzip = url.endswith(".gz") or content[:2] == b"\x1f\x8b"
-    if is_gzip:
+def decompress_if_gzip(url: str, content: bytes) -> bytes:
+    # Check the gzip magic bytes rather than the ".gz" suffix: some clients
+    # (browsers in particular) already decompress the body for us.
+    if content[:2] == b"\x1f\x8b":
         content = gzip.decompress(content)
     return content
 
 
-def parse_sitemap(
-    session: requests.Session, url: str, visited: set[str], pages: list[str]
-) -> None:
+def parse_sitemap(fetcher, url: str, visited: set[str], pages: list[str]) -> None:
     if url in visited:
         return
     visited.add(url)
 
     try:
-        content = fetch_sitemap_bytes(session, url)
-    except (requests.RequestException, OSError):
-        print(f"warning: failed to fetch {url}", file=sys.stderr)
+        content = decompress_if_gzip(url, fetcher.fetch(url))
+    except (FetchError, OSError) as exc:
+        print(f"warning: failed to fetch {url}: {exc}", file=sys.stderr)
         return
 
     try:
@@ -104,7 +168,7 @@ def parse_sitemap(
     if tag == "sitemapindex":
         for loc in root.findall(f"{{{SITEMAP_NS}}}sitemap/{{{SITEMAP_NS}}}loc"):
             if loc.text:
-                parse_sitemap(session, loc.text.strip(), visited, pages)
+                parse_sitemap(fetcher, loc.text.strip(), visited, pages)
     elif tag == "urlset":
         for loc in root.findall(f"{{{SITEMAP_NS}}}url/{{{SITEMAP_NS}}}loc"):
             if loc.text:
@@ -131,22 +195,31 @@ def main() -> None:
     )
     parser.add_argument("url", help="Website URL, e.g. https://example.com")
     parser.add_argument("-o", "--output", help="Output CSV path")
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Fetch through a headless browser (Playwright), for sites that "
+        "block plain HTTP clients",
+    )
     args = parser.parse_args()
 
     site_url = normalize_site_url(args.url)
-    session = build_session()
+    fetcher_cls = BrowserFetcher if args.browser else HttpFetcher
 
-    sitemap_urls = find_sitemap_urls(session, site_url)
-    if not sitemap_urls:
-        print(f"error: no sitemap found for {site_url}", file=sys.stderr)
-        sys.exit(1)
+    with fetcher_cls() as fetcher:
+        sitemap_urls = find_sitemap_urls(fetcher, site_url)
+        if not sitemap_urls:
+            print(f"error: no sitemap found for {site_url}", file=sys.stderr)
+            if not args.browser:
+                print("hint: if the site blocks bots, try --browser", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"found {len(sitemap_urls)} sitemap(s): {', '.join(sitemap_urls)}")
+        print(f"found {len(sitemap_urls)} sitemap(s): {', '.join(sitemap_urls)}")
 
-    visited: set[str] = set()
-    pages: list[str] = []
-    for sitemap_url in sitemap_urls:
-        parse_sitemap(session, sitemap_url, visited, pages)
+        visited: set[str] = set()
+        pages: list[str] = []
+        for sitemap_url in sitemap_urls:
+            parse_sitemap(fetcher, sitemap_url, visited, pages)
 
     pages = list(dict.fromkeys(pages))
 
