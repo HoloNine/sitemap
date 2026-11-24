@@ -45,6 +45,16 @@ Some sites (often WordPress sites with a security plugin or firewall) drop conne
 
 Run `python main.py --help` to see the built-in help.
 
+## Web UI
+
+There's also a Streamlit app with the same features:
+
+```bash
+streamlit run app.py
+```
+
+It opens in your browser at http://localhost:8501. Enter a website, tick **Use headless browser** if the site blocks bots, and click **Find pages**. You can then filter the URLs (for example by `/blog/`), click through to them, and download the full or filtered list as CSV. Results are cached for 10 minutes, so filtering or downloading doesn't fetch the site again.
+
 ## How it works
 
 1. It reads `https://<site>/robots.txt` and looks for `Sitemap:` lines.

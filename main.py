@@ -21,6 +21,10 @@ COMMON_SITEMAP_PATHS = ("/sitemap.xml", "/sitemap_index.xml", "/sitemap.xml.gz")
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
 
+def stderr_log(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
 class FetchError(Exception):
     """A URL could not be fetched; the message says why."""
 
@@ -59,6 +63,14 @@ class HttpFetcher:
         self.session.close()
 
 
+class PlaywrightMissing(Exception):
+    """--browser was requested but Playwright isn't installed."""
+
+
+class NoSitemapError(Exception):
+    """No sitemap could be found for the site."""
+
+
 class BrowserFetcher:
     """Fetches URLs through a headless Chromium browser (Playwright).
 
@@ -69,10 +81,10 @@ class BrowserFetcher:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            sys.exit(
-                "error: --browser needs Playwright: "
+            raise PlaywrightMissing(
+                "browser mode needs Playwright: "
                 "pip install playwright && python -m playwright install chromium"
-            )
+            ) from None
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch()
         self._context = self._browser.new_context()
@@ -109,7 +121,7 @@ def normalize_site_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def find_sitemap_urls(fetcher, site_url: str) -> list[str]:
+def find_sitemap_urls(fetcher, site_url: str, log=stderr_log) -> list[str]:
     robots_url = urljoin(site_url + "/", "robots.txt")
     try:
         text = fetcher.fetch(robots_url).decode("utf-8", errors="replace")
@@ -121,14 +133,14 @@ def find_sitemap_urls(fetcher, site_url: str) -> list[str]:
         if sitemaps:
             return sitemaps
     except FetchError as exc:
-        print(f"warning: {robots_url}: {exc}", file=sys.stderr)
+        log(f"{robots_url}: {exc}")
 
     for path in COMMON_SITEMAP_PATHS:
         candidate = urljoin(site_url, path)
         try:
             content = decompress_if_gzip(candidate, fetcher.fetch(candidate))
         except FetchError as exc:
-            print(f"warning: {candidate}: {exc}", file=sys.stderr)
+            log(f"{candidate}: {exc}")
             continue
         except OSError:
             continue
@@ -146,7 +158,9 @@ def decompress_if_gzip(url: str, content: bytes) -> bytes:
     return content
 
 
-def parse_sitemap(fetcher, url: str, visited: set[str], pages: list[str]) -> None:
+def parse_sitemap(
+    fetcher, url: str, visited: set[str], pages: list[str], log=stderr_log
+) -> None:
     if url in visited:
         return
     visited.add(url)
@@ -154,13 +168,13 @@ def parse_sitemap(fetcher, url: str, visited: set[str], pages: list[str]) -> Non
     try:
         content = decompress_if_gzip(url, fetcher.fetch(url))
     except (FetchError, OSError) as exc:
-        print(f"warning: failed to fetch {url}: {exc}", file=sys.stderr)
+        log(f"failed to fetch {url}: {exc}")
         return
 
     try:
         root = etree.fromstring(content)
     except etree.XMLSyntaxError:
-        print(f"warning: failed to parse {url}", file=sys.stderr)
+        log(f"failed to parse {url}")
         return
 
     tag = etree.QName(root.tag).localname
@@ -168,11 +182,31 @@ def parse_sitemap(fetcher, url: str, visited: set[str], pages: list[str]) -> Non
     if tag == "sitemapindex":
         for loc in root.findall(f"{{{SITEMAP_NS}}}sitemap/{{{SITEMAP_NS}}}loc"):
             if loc.text:
-                parse_sitemap(fetcher, loc.text.strip(), visited, pages)
+                parse_sitemap(fetcher, loc.text.strip(), visited, pages, log)
     elif tag == "urlset":
         for loc in root.findall(f"{{{SITEMAP_NS}}}url/{{{SITEMAP_NS}}}loc"):
             if loc.text:
                 pages.append(loc.text.strip())
+
+
+def collect_pages(
+    site_url: str, use_browser: bool = False, log=stderr_log
+) -> tuple[list[str], list[str]]:
+    """Find the site's sitemaps and return (sitemap_urls, unique page URLs).
+
+    Raises NoSitemapError if no sitemap is found, and PlaywrightMissing if
+    browser mode is requested without Playwright installed.
+    """
+    fetcher_cls = BrowserFetcher if use_browser else HttpFetcher
+    with fetcher_cls() as fetcher:
+        sitemap_urls = find_sitemap_urls(fetcher, site_url, log)
+        if not sitemap_urls:
+            raise NoSitemapError(f"no sitemap found for {site_url}")
+        visited: set[str] = set()
+        pages: list[str] = []
+        for sitemap_url in sitemap_urls:
+            parse_sitemap(fetcher, sitemap_url, visited, pages, log)
+    return sitemap_urls, list(dict.fromkeys(pages))
 
 
 def write_csv(pages: list[str], output_path: str) -> None:
@@ -204,24 +238,18 @@ def main() -> None:
     args = parser.parse_args()
 
     site_url = normalize_site_url(args.url)
-    fetcher_cls = BrowserFetcher if args.browser else HttpFetcher
 
-    with fetcher_cls() as fetcher:
-        sitemap_urls = find_sitemap_urls(fetcher, site_url)
-        if not sitemap_urls:
-            print(f"error: no sitemap found for {site_url}", file=sys.stderr)
-            if not args.browser:
-                print("hint: if the site blocks bots, try --browser", file=sys.stderr)
-            sys.exit(1)
+    try:
+        sitemap_urls, pages = collect_pages(site_url, args.browser)
+    except PlaywrightMissing as exc:
+        sys.exit(f"error: {exc}")
+    except NoSitemapError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        if not args.browser:
+            print("hint: if the site blocks bots, try --browser", file=sys.stderr)
+        sys.exit(1)
 
-        print(f"found {len(sitemap_urls)} sitemap(s): {', '.join(sitemap_urls)}")
-
-        visited: set[str] = set()
-        pages: list[str] = []
-        for sitemap_url in sitemap_urls:
-            parse_sitemap(fetcher, sitemap_url, visited, pages)
-
-    pages = list(dict.fromkeys(pages))
+    print(f"found {len(sitemap_urls)} sitemap(s): {', '.join(sitemap_urls)}")
 
     if not pages:
         print(f"error: no pages found in sitemap(s) for {site_url}", file=sys.stderr)
